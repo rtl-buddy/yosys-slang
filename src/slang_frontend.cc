@@ -2603,6 +2603,54 @@ public:
 		}
 	}
 
+
+	// Instances of modules with no definition, kept when --ignore-unknown-modules is given
+	// (rtl-buddy fork: upstream retired this in 3774661; rtl-buddy's synthesis parameter probe
+	// depends on it). The ports' widths and directions are unknown: a connection that is
+	// assignable is taken as driven by the cell, any other as an input to it.
+	void handle(const ast::UninstantiatedDefSymbol &sym)
+	{
+#ifndef SLANG_NO_YOSYS
+		if (sym.isChecker()) {
+			netlist.add_diag(diag::LangFeatureUnsupported, sym.location);
+			return;
+		}
+
+		if (!sym.paramExpressions.empty()) {
+			netlist.add_diag(diag::NoParamsOnUnkBboxes, sym.location);
+			return;
+		}
+
+		RTLIL::Cell *cell = netlist.backend->canvas->addCell(netlist.id(sym),
+				RTLIL::escape_id(std::string{sym.definitionName}));
+		cell->set_string_attribute(ID::hdlname, netlist.hdlname(sym));
+		transfer_attrs(netlist, sym, cell);
+
+		auto port_names = sym.getPortNames();
+		auto port_conns = sym.getPortConnections();
+		ast_invariant(sym, port_names.size() == port_conns.size());
+		for (int i = 0; i < (int) port_names.size(); i++) {
+			auto &expr = port_conns[i]->as<ast::SimpleAssertionExpr>().expr;
+			std::string port_id = port_names[i].empty()
+				? Yosys::stringf("$%d", i + 1)
+				: RTLIL::escape_id(std::string{port_names[i]});
+
+			VariableBits vbits = netlist.eval.lhs(expr, true);
+			if (!vbits.has_dummy_bits()) {
+				netlist.register_driven(vbits);
+				cell->setPort(port_id, RTLIL::SigSpec(netlist.convert_static(vbits)));
+			} else {
+				if (!port_names[i].empty()) {
+					auto &d = netlist.add_diag(diag::GuessingInputPort, expr.sourceRange);
+					d << port_names[i] << sym.definitionName;
+				}
+				cell->setPort(port_id, RTLIL::SigSpec(netlist.eval(expr)));
+			}
+		}
+#else
+		netlist.add_diag(diag::LangFeatureUnsupported, sym.location);
+#endif
+	}
 	void handle(const ast::ContinuousAssignSymbol &symbol)
 	{
 		if (symbol.getDelay() && !settings.ignore_timing.value_or(false))
@@ -3926,9 +3974,6 @@ void catch_forbidden_options(slang::driver::Driver &driver) {
 		engine.issue(diag);
 	}
 
-	if (driver.options.compilationFlags[ast::CompilationFlags::IgnoreUnknownModules]) {
-		engine.issue({diag::NoIgnoreUnknownModules, slang::SourceLocation::NoLocation});
-	}
 }
 
 void fixup_options(SynthesisSettings &settings, slang::driver::Driver &driver)
